@@ -2,9 +2,10 @@
   "name": "claude-permission-popup",
   "displayName": "Claude Code Permission Popup",
   "description": "Shows VS Code modal dialogs for Claude Code permission requests",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "publisher": "claude-code-contrib",
   "license": "MIT",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/claude-code-contrib/claude-permission-popup"
@@ -14,6 +15,7 @@
   },
   "homepage": "https://github.com/claude-code-contrib/claude-permission-popup#readme",
   "categories": [
+    "Programming Languages",
     "Other"
   ],
   "keywords": [
@@ -29,12 +31,42 @@
   "activationEvents": [
     "onStartupFinished"
   ],
-  "extensionKind": ["workspace"],
+  "extensionKind": [
+    "workspace"
+  ],
   "main": "./extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "This extension runs an HTTP server and requires a trusted workspace."
+    }
+  },
   "scripts": {
+    "lint": "eslint extension.js",
+    "test:smoke": "node test-smoke.js",
+    "test": "npm run test:smoke",
+    "vscode:prepublish": "npm run lint && npm run test",
     "package": "vsce package"
   },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0",
+    "eslint": "^8.56.0"
+  },
   "contributes": {
+    "commands": [
+      {
+        "command": "claudePermissionPopup.showLogs",
+        "title": "Claude Permission Popup: Show Logs"
+      },
+      {
+        "command": "claudePermissionPopup.installHook",
+        "title": "Claude Permission Popup: Install Hook"
+      },
+      {
+        "command": "claudePermissionPopup.revokeAllowAll",
+        "title": "Claude Permission Popup: Revoke Allow All"
+      }
+    ],
     "configuration": {
       "title": "Claude Permission Popup",
       "properties": {
@@ -49,6 +81,39 @@
           "description": "Timeout in milliseconds for the permission modal dialog. If no response within this time, the modal is dismissed and falls back to terminal prompt. Default: 300000 (5 minutes)."
         }
       }
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "claudePermissionPopup.gettingStarted",
+        "title": "Get Started with Claude Permission Popup",
+        "description": "Set up the Claude Code permission popup in a few steps.",
+        "steps": [
+          {
+            "id": "checkActivation",
+            "title": "Verify Extension Activation",
+            "description": "The extension starts automatically. Look for the shield icon in the status bar: **$(shield) Claude Permissions**.\n\nClick it to open the extension logs.",
+            "media": {
+              "markdown": "The status bar should show **$(shield) Claude Permissions** when the extension is active."
+            }
+          },
+          {
+            "id": "installHook",
+            "title": "Install the Hook Script",
+            "description": "Run the **Claude Permission Popup: Install Hook** command from the Command Palette to automatically configure the hook in your `.claude/settings.json`.\n\n[Install Hook](command:claudePermissionPopup.installHook)",
+            "media": {
+              "markdown": "This writes the hook configuration so Claude Code routes permission requests to the extension."
+            }
+          },
+          {
+            "id": "testIt",
+            "title": "Test the Integration",
+            "description": "Start Claude Code and trigger any tool that requires permission (e.g., a Bash command). A modal dialog should appear in VS Code.\n\nCheck the **Output** panel → **Claude Permission Popup** for logs.",
+            "media": {
+              "markdown": "You should see a modal dialog with **Allow** / **Deny** / **Allow All for Session** buttons."
+            }
+          }
+        ]
+      }
+    ]
   }
 }

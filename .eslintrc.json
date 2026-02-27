@@ -1,0 +1,24 @@
+{
+  "env": {
+    "node": true,
+    "es2020": true,
+    "mocha": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2020
+  },
+  "rules": {
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "no-const-assign": "error",
+    "no-dupe-keys": "error",
+    "no-undef": "error",
+    "eqeqeq": ["warn", "always"],
+    "no-var": "warn",
+    "prefer-const": "warn",
+    "semi": ["warn", "always"],
+    "curly": ["warn", "multi-line"]
+  },
+  "globals": {
+    "vscode": "readonly"
+  }
+}

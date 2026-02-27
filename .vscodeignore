@@ -1,0 +1,9 @@
+.vscode/**
+.vscode-test/**
+test/**
+test-smoke.js
+.eslintrc.json
+.vscode-test.mjs
+*.vsix
+.gitignore
+node_modules/**
