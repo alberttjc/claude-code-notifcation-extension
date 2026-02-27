@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Claude Code PermissionRequest hook
-# Posts permission requests to the VS Code extension for modal popup approval.
+# Notifies the VS Code extension that a permission request is pending.
+# The user approves/denies in the terminal — this hook only triggers alerts.
 # Falls back silently to terminal prompt if the extension isn't running.
 
 set -u
@@ -112,56 +113,16 @@ if [ -z "$PAYLOAD" ]; then
   exit 0
 fi
 
-# Post to the extension's HTTP server, capturing HTTP status code
-HTTP_RESPONSE=$(printf '%s' "$PAYLOAD" | curl -s \
-  --fail-with-body \
+# Fire-and-forget: notify the extension, discard response, short timeout
+printf '%s' "$PAYLOAD" | curl -s \
+  -o /dev/null \
   --connect-timeout 2 \
-  --max-time 300 \
-  -w '\n%{http_code}' \
+  --max-time 5 \
   -X POST \
   -H "Content-Type: application/json" \
   -H "X-Claude-Permission: true" \
   -H "Authorization: Bearer ${AUTH_TOKEN}" \
   --data-binary @- \
-  "http://127.0.0.1:${PORT}/permission" 2>/dev/null)
+  "http://127.0.0.1:${PORT}/notify" 2>/dev/null || true
 
-if [ $? -ne 0 ]; then
-  echo "Warning: Failed to reach permission popup server" >&2
-  exit 0
-fi
-
-# Split response body and HTTP status code
-HTTP_STATUS="${HTTP_RESPONSE##*$'\n'}"
-HTTP_BODY="${HTTP_RESPONSE%$'\n'*}"
-
-# Handle non-200 responses
-if [ "$HTTP_STATUS" != "200" ]; then
-  if [ "$HTTP_STATUS" = "429" ]; then
-    # Queue full or rate limited — emit explicit deny
-    echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}'
-    exit 0
-  fi
-  echo "Warning: Permission popup server returned HTTP $HTTP_STATUS" >&2
-  exit 0
-fi
-
-# Parse the decision from the response using Node.js
-DECISION=$(printf '%s' "$HTTP_BODY" | node -e "
-  let data = '';
-  process.stdin.on('data', c => data += c);
-  process.stdin.on('end', () => {
-    try {
-      const parsed = JSON.parse(data);
-      process.stdout.write(parsed.decision || '');
-    } catch (e) {
-      process.exit(1);
-    }
-  });
-" 2>/dev/null) || { echo "Warning: Failed to parse server response" >&2; exit 0; }
-
-if [ "$DECISION" = "allow" ]; then
-  echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
-elif [ "$DECISION" = "deny" ]; then
-  echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}'
-fi
-# If decision is "dismissed" or unknown, output nothing (fall back to terminal prompt)
+# Exit with no stdout — Claude Code will show its terminal permission prompt

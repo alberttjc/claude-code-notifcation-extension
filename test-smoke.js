@@ -22,58 +22,31 @@ function check(name, ok) {
 }
 
 // ─── Mock vscode module ─────────────────────────────────────────────
-let lastQuickPickTitle = null;
-let quickPickAutoReply = 'Allow'; // 'Allow', 'Deny', 'Allow All for Session', or null (dismiss)
-
-function createMockQuickPick() {
-  let onAcceptCb = null;
-  let onHideCb = null;
-  const qp = {
-    title: '',
-    placeholder: '',
-    items: [],
-    selectedItems: [],
-    ignoreFocusOut: false,
-    show() {
-      lastQuickPickTitle = qp.title;
-      // Simulate user selection asynchronously
-      if (quickPickAutoReply === null) {
-        // Simulate dismiss (Escape)
-        setTimeout(() => { if (onHideCb) onHideCb(); }, 0);
-      } else {
-        setTimeout(() => {
-          // Find the matching item
-          const match = qp.items.find(i => i.label.includes(quickPickAutoReply));
-          qp.selectedItems = match ? [match] : [];
-          if (onAcceptCb) onAcceptCb();
-        }, 0);
-      }
-    },
-    hide() { if (onHideCb) onHideCb(); },
-    dispose() {},
-    onDidAccept(cb) { onAcceptCb = cb; },
-    onDidHide(cb) { onHideCb = cb; },
-  };
-  return qp;
-}
+const warningMessages = [];
+const executedCommands = [];
 
 const vscodeMock = {
   StatusBarAlignment: { Left: 1, Right: 2 },
+  ThemeColor: class ThemeColor {
+    constructor(id) { this.id = id; }
+  },
   workspace: {
     getConfiguration: () => ({
-      get: (_key, def) => def,   // port = 0 (random), modalTimeout = default
+      get: (_key, def) => def,   // port = 0 (random), osNotifications = true
     }),
     onDidChangeConfiguration: (_cb) => ({ dispose: () => {} }),
     workspaceFolders: null,
   },
   commands: {
-    executeCommand: () => Promise.resolve(),
+    executeCommand: (cmd) => {
+      executedCommands.push(cmd);
+      return Promise.resolve();
+    },
     registerCommand: (_id, _cb) => ({ dispose: () => {} }),
   },
   window: {
-    createQuickPick: () => createMockQuickPick(),
     showWarningMessage: (msg, ...args) => {
-      // Still used for server error messages, not for permission dialogs
+      warningMessages.push({ msg, args });
       return Promise.resolve();
     },
     showErrorMessage: (msg) => {
@@ -91,6 +64,7 @@ const vscodeMock = {
       text: '',
       tooltip: '',
       command: '',
+      backgroundColor: undefined,
       show: () => {},
       hide: () => {},
       dispose: () => {},
@@ -99,8 +73,6 @@ const vscodeMock = {
 };
 
 // Inject mock before requiring the extension
-// We can't use require.resolve('vscode') because the module doesn't exist,
-// so we hook into Module._resolveFilename to intercept it.
 const Module = require('module');
 const originalResolve = Module._resolveFilename;
 Module._resolveFilename = function (request, parent, isMain, options) {
@@ -122,7 +94,7 @@ function request(port, token, headers, body, method, urlPath) {
     const opts = {
       hostname: '127.0.0.1',
       port,
-      path: urlPath || '/permission',
+      path: urlPath || '/notify',
       method: method || 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -160,7 +132,14 @@ function sleep(ms) {
   console.log('\n=== Claude Permission Popup — Smoke Tests ===\n');
 
   // 1. Activate the extension
-  const fakeContext = { subscriptions: [] };
+  const stateStore = {};
+  const fakeContext = {
+    subscriptions: [],
+    workspaceState: {
+      get(key, defaultValue) { return key in stateStore ? stateStore[key] : defaultValue; },
+      update(key, value) { stateStore[key] = value; return Promise.resolve(); },
+    },
+  };
   ext.activate(fakeContext);
 
   // Wait for server to start and write runtime files
@@ -194,29 +173,43 @@ function sleep(ms) {
   const rHealth = await request(port, authToken, {}, undefined, 'GET', '/health');
   check('health status 200', rHealth.status === 200);
   check('health returns ok', rHealth.json && rHealth.json.status === 'ok');
-  check('health does not leak queue state', rHealth.json && rHealth.json.queue === undefined);
 
-  // ── Test: valid request -> allow ─────────────────────────────────
-  console.log('\n--- Valid request ---');
-  quickPickAutoReply = 'Allow';
+  // ── Test: POST /notify returns immediately with notified ───────
+  console.log('\n--- POST /notify ---');
+  warningMessages.length = 0;
+  executedCommands.length = 0;
   const r1 = await request(port, authToken, authHeaders, {
     tool_name: 'Bash',
     tool_input: { command: 'ls -la' },
   });
   check('status 200', r1.status === 200);
-  check('decision is allow', r1.json && r1.json.decision === 'allow');
-  check('createQuickPick was called', lastQuickPickTitle !== null);
-  check('title mentions tool name', lastQuickPickTitle && lastQuickPickTitle.includes('Bash'));
+  check('response has status notified', r1.json && r1.json.status === 'notified');
+  check('no decision in response', r1.json && r1.json.decision === undefined);
 
-  // ── Test: deny decision ──────────────────────────────────────────
-  console.log('\n--- Deny decision ---');
-  quickPickAutoReply = 'Deny';
-  const r1b = await request(port, authToken, authHeaders, {
+  // Give async handlers a tick to fire
+  await sleep(50);
+  check('showWarningMessage was called', warningMessages.length > 0);
+  check('warning mentions tool name', warningMessages.length > 0 && warningMessages[0].msg.includes('Bash'));
+  check('focusWindow was called', executedCommands.includes('workbench.action.focusWindow'));
+
+  // ── Test: POST /permission (old endpoint) returns 404 ─────────
+  console.log('\n--- Old /permission endpoint ---');
+  const rOld = await request(port, authToken, authHeaders, {
+    tool_name: 'Bash',
+    tool_input: { command: 'ls' },
+  }, 'POST', '/permission');
+  check('old endpoint returns 404', rOld.status === 404);
+
+  // ── Test: /notify response time < 500ms (fire-and-forget) ─────
+  console.log('\n--- Response time ---');
+  await sleep(300); // let rate limiter window clear
+  const startTime = Date.now();
+  const rFast = await request(port, authToken, authHeaders, {
     tool_name: 'Write',
-    tool_input: { file_path: '/etc/passwd' },
+    tool_input: { file_path: '/tmp/test.txt', content: 'hello' },
   });
-  check('status 200', r1b.status === 200);
-  check('decision is deny', r1b.json && r1b.json.decision === 'deny');
+  const elapsed = Date.now() - startTime;
+  check('response time < 500ms', rFast.status === 200 && elapsed < 500);
 
   // ── Test: missing X-Claude-Permission header -> 403 ──────────────
   console.log('\n--- Missing header ---');
@@ -246,71 +239,10 @@ function sleep(ms) {
   const r5 = await request(port, authToken, authHeaders, 'not-json{{{');
   check('status 400', r5.status === 400);
 
-  // ── Test: queue overflow -> 429 ──────────────────────────────────
-  console.log('\n--- Queue overflow (>10 concurrent) ---');
-  // Make createQuickPick hang (never call onDidAccept/onDidHide) to keep queue full
-  const hangingResolvers = [];
-  vscodeMock.window.createQuickPick = () => {
-    let onAcceptCb = null;
-    let onHideCb = null;
-    const qp = {
-      title: '', placeholder: '', items: [], selectedItems: [],
-      ignoreFocusOut: false,
-      show() {
-        lastQuickPickTitle = qp.title;
-        // Don't auto-resolve — hang until manually drained
-        hangingResolvers.push((reply) => {
-          if (reply === null) {
-            if (onHideCb) onHideCb();
-          } else {
-            const match = qp.items.find(i => i.label.includes(reply));
-            qp.selectedItems = match ? [match] : [];
-            if (onAcceptCb) onAcceptCb();
-          }
-        });
-      },
-      hide() { if (onHideCb) onHideCb(); },
-      dispose() {},
-      onDidAccept(cb) { onAcceptCb = cb; },
-      onDidHide(cb) { onHideCb = cb; },
-    };
-    return qp;
-  };
-
-  // Fire 12 concurrent requests — first goes to processing, next 10 fill the queue, #12 should get 429
-  const pending = [];
-  for (let i = 0; i < 12; i++) {
-    pending.push(request(port, authToken, authHeaders, {
-      tool_name: `QueueTest-${i}`,
-      tool_input: {},
-    }));
-    // Small stagger to avoid hitting rate limit
-    await sleep(50);
-  }
-
-  // Wait for all requests to reach the server and the 429 to be sent
-  await sleep(500);
-
-  // Drain: resolve hanging QuickPicks in a loop until all pending requests complete
-  const drainInterval = setInterval(() => {
-    while (hangingResolvers.length > 0) {
-      hangingResolvers.shift()('Allow');
-    }
-  }, 50);
-
-  const results = await Promise.all(pending);
-  clearInterval(drainInterval);
-
-  const got429 = results.some((r) => r.status === 429);
-  check('at least one request got 429', got429);
-
   // ── Test: hook script end-to-end ─────────────────────────────────
   console.log('\n--- Hook script integration ---');
-  // Reset the mock to auto-allow (instant resolve)
-  vscodeMock.window.createQuickPick = () => createMockQuickPick();
-  quickPickAutoReply = 'Allow';
-  // Wait for any remaining queued requests to drain
-  await sleep(500);
+  // Wait for any rate limiting to clear
+  await sleep(1200);
 
   const hookScript = path.join(__dirname, 'hooks', 'permission-request.sh');
   const hookPayload = JSON.stringify({
@@ -330,7 +262,7 @@ function sleep(ms) {
         },
       }, (err, stdout, stderr) => {
         if (err) return reject(err);
-        resolve(stdout.trim());
+        resolve(stdout);
       });
       child.stdin.write(hookPayload);
       child.stdin.end();
@@ -340,19 +272,10 @@ function sleep(ms) {
     console.log(`  [hook error] ${err.message}`);
   }
 
-  if (hookResult) {
-    let hookJson;
-    try { hookJson = JSON.parse(hookResult); } catch {}
-    check('hook returns valid JSON', hookJson !== undefined);
-    check('hook decision is allow',
-      hookJson &&
-      hookJson.hookSpecificOutput &&
-      hookJson.hookSpecificOutput.decision &&
-      hookJson.hookSpecificOutput.decision.behavior === 'allow'
-    );
+  if (hookResult !== null) {
+    check('hook produces no stdout (empty)', hookResult.trim() === '');
   } else {
-    check('hook returns valid JSON', false);
-    check('hook decision is allow', false);
+    check('hook produces no stdout (empty)', false);
   }
 
   // ── Test: formatToolDetail Read line ranges ─────────────────────

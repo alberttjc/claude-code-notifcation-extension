@@ -1,7 +1,7 @@
 {
   "name": "claude-permission-popup",
   "displayName": "Claude Code Permission Popup",
-  "description": "Shows VS Code modal dialogs for Claude Code permission requests",
+  "description": "Alerts you in VS Code when Claude Code is waiting for permission approval",
   "version": "0.1.0",
   "publisher": "claude-code-contrib",
   "license": "MIT",
@@ -23,7 +23,7 @@
     "claude-code",
     "permission",
     "hooks",
-    "modal"
+    "notification"
   ],
   "engines": {
     "vscode": "^1.85.0"
@@ -63,8 +63,8 @@
         "title": "Claude Permission Popup: Install Hook"
       },
       {
-        "command": "claudePermissionPopup.revokeAllowAll",
-        "title": "Claude Permission Popup: Revoke Allow All"
+        "command": "claudePermissionPopup.focusTerminal",
+        "title": "Claude Permission Popup: Focus Terminal"
       }
     ],
     "configuration": {
@@ -73,12 +73,12 @@
         "claudePermissionPopup.port": {
           "type": "number",
           "default": 0,
-          "description": "Port for the permission request HTTP server. Set to 0 (default) for a random available port. The actual port is written to a runtime file for the hook script to discover automatically."
+          "description": "Port for the notification HTTP server. Set to 0 (default) for a random available port. The actual port is written to a runtime file for the hook script to discover automatically."
         },
-        "claudePermissionPopup.modalTimeout": {
-          "type": "number",
-          "default": 300000,
-          "description": "Timeout in milliseconds for the permission modal dialog. If no response within this time, the modal is dismissed and falls back to terminal prompt. Default: 300000 (5 minutes)."
+        "claudePermissionPopup.osNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send OS-level notifications (via notify-send on Linux, osascript on macOS) when Claude Code is waiting for permission. Useful when VS Code is not in the foreground."
         }
       }
     },
@@ -101,15 +101,15 @@
             "title": "Install the Hook Script",
             "description": "Run the **Claude Permission Popup: Install Hook** command from the Command Palette to automatically configure the hook in your `.claude/settings.json`.\n\n[Install Hook](command:claudePermissionPopup.installHook)",
             "media": {
-              "markdown": "This writes the hook configuration so Claude Code routes permission requests to the extension."
+              "markdown": "This writes the hook configuration so Claude Code notifies the extension when permission is needed."
             }
           },
           {
             "id": "testIt",
             "title": "Test the Integration",
-            "description": "Start Claude Code and trigger any tool that requires permission (e.g., a Bash command). A modal dialog should appear in VS Code.\n\nCheck the **Output** panel → **Claude Permission Popup** for logs.",
+            "description": "Start Claude Code and trigger any tool that requires permission (e.g., a Bash command). You should see a VS Code warning notification, a yellow status bar, and an OS notification.\n\nApprove or deny the request in the terminal.\n\nCheck the **Output** panel → **Claude Permission Popup** for logs.",
             "media": {
-              "markdown": "You should see a modal dialog with **Allow** / **Deny** / **Allow All for Session** buttons."
+              "markdown": "You should see a warning notification with a **Show Terminal** button and the status bar turning yellow."
             }
           }
         ]

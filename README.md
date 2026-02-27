@@ -1,28 +1,26 @@
 # Claude Code Permission Popup
 
-A VS Code extension that shows interactive popup dialogs for Claude Code permission requests instead of terminal prompts.
+A VS Code extension that alerts you when Claude Code is waiting for permission approval in the terminal.
 
 ## How It Works
 
 1. Claude Code triggers a permission hook when it wants to run a tool (e.g., Bash, Write, Edit)
-2. The hook script (`permission-request.sh`) first runs a health check, then sends the request to a local HTTP server run by the extension
-3. VS Code shows a QuickPick dialog with the tool name and details
-4. You select **Allow**, **Deny**, or **Allow All for Session**, and the decision flows back to Claude Code
-5. Pressing **Escape** dismisses the dialog and falls back to the terminal prompt
+2. The hook script (`permission-request.sh`) sends a fire-and-forget notification to the extension's local HTTP server
+3. The extension alerts you three ways: VS Code warning notification, yellow status bar, and OS notification
+4. You approve or deny the request directly in the terminal (where Claude Code shows its permission prompt)
+5. If the extension isn't running, the hook silently exits and Claude Code shows its terminal prompt as usual
 
-The extension shows a clickable status bar indicator (`$(shield) Claude Permissions`) with the count of pending requests. Click it to open the logs. All activity is logged to the **Claude Permission Popup** output channel.
-
-If the extension isn't running, the hook silently exits and Claude Code falls back to its default terminal prompt.
+The extension shows a clickable status bar indicator (`$(shield) Claude Permissions`). When a permission request arrives, the bar turns yellow with a bell icon. Click it to focus the terminal. It auto-resets after 30 seconds. All activity is logged to the **Claude Permission Popup** output channel.
 
 ## Project Structure
 
 ```
 claude-permission-popup/
 ├── package.json                            # Extension manifest and configuration
-├── extension.js                            # HTTP server + QuickPick dialog logic
+├── extension.js                            # HTTP server + notification logic
 ├── hooks/permission-request.sh             # Claude Code hook script (uses node + curl)
 ├── icon.png                                # 128x128 extension icon
-├── test-smoke.js                           # Smoke tests (30 tests)
+├── test-smoke.js                           # Smoke tests
 ├── .vscodeignore                           # Files excluded from packaged extension
 ├── .eslintrc.json                          # ESLint configuration
 ├── CHANGELOG.md                            # Version history
@@ -88,7 +86,7 @@ Replace `/path/to/` with the actual path to the extension source.
 | Setting | Default | Description |
 |---|---|---|
 | `claudePermissionPopup.port` | `0` | Port for the local HTTP server. `0` = random available port, auto-discovered by the hook script. |
-| `claudePermissionPopup.modalTimeout` | `300000` | Timeout in ms for the permission dialog. Default: 5 minutes. If no response, the dialog is dismissed and Claude Code falls back to the terminal prompt. |
+| `claudePermissionPopup.osNotifications` | `true` | Send OS-level notifications (via `notify-send` on Linux, `osascript` on macOS) when permission is needed. Useful when VS Code is not in the foreground. |
 
 The port and auth token are shared automatically via runtime files in `/tmp/claude-permission-popup-$USER/`. No environment variables need to be set.
 
@@ -98,24 +96,25 @@ The port and auth token are shared automatically via runtime files in `/tmp/clau
 |---|---|
 | **Claude Permission Popup: Show Logs** | Opens the output channel with extension logs |
 | **Claude Permission Popup: Install Hook** | Auto-configures the hook in `.claude/settings.json` |
-| **Claude Permission Popup: Revoke Allow All** | Disables the "Allow All for Session" auto-approve mode and restores per-request prompts |
+| **Claude Permission Popup: Focus Terminal** | Focuses the integrated terminal and resets the status bar |
 
 All commands are available from the Command Palette (`Ctrl+Shift+P`).
 
 ## Features
 
-### Permission Dialog
+### Permission Alerts
 
-When Claude Code requests permission, a QuickPick dialog appears with three options:
+When Claude Code requests permission, you're alerted three ways:
 
-- **Allow** — Permit this specific action
-- **Deny** — Block this specific action
-- **Allow All for Session** — Auto-approve all subsequent requests until the VS Code window is reloaded or **Claude Permission Popup: Revoke Allow All** is run
+- **VS Code warning notification** — Shows the tool name with a "Show Terminal" button
+- **Status bar highlight** — The status bar turns yellow with a bell icon and the tool name; click to focus the terminal. Auto-resets after 30 seconds.
+- **OS notification** — A system notification via `notify-send` (Linux) or `osascript` (macOS), configurable via `osNotifications` setting
+
+You approve or deny the request in the terminal, where Claude Code shows its standard permission prompt.
 
 ### Reliability
 
 - **Health check endpoint** — `GET /health` returns `{ status: "ok" }`. The hook script checks this before sending requests for faster failure detection.
-- **Graceful shutdown** — When the extension deactivates, all pending requests receive a `dismissed` response so Claude Code doesn't hang waiting.
 - **Server auto-restart** — If the HTTP server crashes unexpectedly, the extension waits 1 second and attempts to restart.
 - **Stale file cleanup** — On activation, detects and removes leftover runtime files from previous crashes.
 
@@ -124,7 +123,6 @@ When Claude Code requests permission, a QuickPick dialog appears with three opti
 - **Auth token** — A random 64-character hex token is generated per session and required on all requests (`Authorization: Bearer <token>`)
 - **Custom header** — Requires `X-Claude-Permission: true` header to block browser cross-origin requests
 - **Body size limit** — Rejects request bodies larger than 1 MB (HTTP 413)
-- **Queue cap** — Maximum 10 pending requests; additional requests receive HTTP 429
 - **Per-second rate limiting** — Maximum 5 requests per second; excess requests receive HTTP 429
 - **Runtime directory validation** — Checks the runtime directory is not a symlink and is owned by the current user (`stat.uid`)
 - **Localhost only** — Server binds to `127.0.0.1`, never exposed to the network
@@ -134,13 +132,13 @@ When Claude Code requests permission, a QuickPick dialog appears with three opti
 
 ### Smoke Tests
 
-Run the full test suite (30 tests):
+Run the full test suite:
 
 ```sh
 npm test
 ```
 
-Tests cover: health endpoint, allow/deny decisions, QuickPick UI, auth (403/401), body size limit (413), invalid JSON (400), queue overflow (429), hook script end-to-end, `formatToolDetail`, and `truncate`.
+Tests cover: health endpoint, notification delivery, response time, old endpoint rejection, auth (403/401), body size limit (413), invalid JSON (400), hook script end-to-end, `formatToolDetail`, and `truncate`.
 
 ### Manual Testing
 
@@ -151,7 +149,7 @@ Verify the extension is running:
 curl -s http://127.0.0.1:$(cat /tmp/claude-permission-popup-$USER/port)/health
 ```
 
-Send a test permission request:
+Send a test notification:
 
 ```sh
 curl -s -X POST \
@@ -159,16 +157,18 @@ curl -s -X POST \
   -H "x-claude-permission: true" \
   -H "Authorization: Bearer $(cat /tmp/claude-permission-popup-$USER/auth-token)" \
   -d '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
-  "http://127.0.0.1:$(cat /tmp/claude-permission-popup-$USER/port)/permission"
+  "http://127.0.0.1:$(cat /tmp/claude-permission-popup-$USER/port)/notify"
 ```
 
-A QuickPick dialog should appear in VS Code. Selecting Allow returns `{"decision":"allow"}`, Deny returns `{"decision":"deny"}`, Allow All for Session returns `{"decision":"allow"}` and enables auto-approve mode, and pressing Escape returns `{"decision":"dismissed"}`.
+You should see `{"status":"notified"}` returned immediately, a VS Code warning notification, and a yellow status bar.
 
 Test the hook script directly:
 
 ```sh
 echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | ./hooks/permission-request.sh
 ```
+
+The script should produce no stdout (Claude Code will show its terminal prompt).
 
 Check the **Output** panel → **Claude Permission Popup** for logs.
 
@@ -193,7 +193,7 @@ No authentication required. Returns server status.
 { "status": "ok" }
 ```
 
-### `POST /permission`
+### `POST /notify`
 
 Requires `X-Claude-Permission: true` header and `Authorization: Bearer <token>` header.
 
@@ -207,14 +207,14 @@ Requires `X-Claude-Permission: true` header and `Authorization: Bearer <token>` 
 
 **Response:**
 ```json
-{ "decision": "allow" }
+{ "status": "notified" }
 ```
 
-Possible `decision` values: `"allow"`, `"deny"`, `"dismissed"`.
+The response is returned immediately (fire-and-forget). The extension shows the notification asynchronously.
 
 ## Tool Detail Formatting
 
-The dialog shows tool-specific details:
+The notification includes tool-specific details in the logs:
 
 | Tool | Detail shown |
 |---|---|
@@ -222,7 +222,7 @@ The dialog shows tool-specific details:
 | **Edit / MultiEdit** | File path + old/new string previews |
 | **Write** | File path + content preview |
 | **Grep** | Pattern + search path |
-| **Read** | File path + line range (e.g., "lines 10–29") |
+| **Read** | File path + line range (e.g., "lines 10-29") |
 | **Other** | Command, file path, or truncated JSON |
 
 ## Development

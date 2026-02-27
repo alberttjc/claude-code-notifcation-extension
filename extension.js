@@ -3,24 +3,20 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 const vscode = require('vscode');
 
 const MAX_BODY = 1024 * 1024; // 1 MB
-const MAX_QUEUE = 10;
 const MAX_DISPLAY_LEN = 500;
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const RATE_LIMIT_WINDOW_MS = 1000;
 const RATE_LIMIT_MAX = 5;
+const STATUS_BAR_DECAY_MS = 30 * 1000; // 30 seconds
 
 let server = null;
 let runtimeDir = null;
 let outputChannel = null;
 let statusBarItem = null;
-let allowAllForSession = false;
-
-// Permission request queue — processes one dialog at a time
-const requestQueue = [];
-let processing = false;
+let statusBarDecayTimer = null;
 
 // Rate limiting state
 const rateLimitTimestamps = [];
@@ -40,17 +36,81 @@ function log(message) {
 
 function updateStatusBar() {
   if (!statusBarItem) return;
-  const pending = requestQueue.length + (processing ? 1 : 0);
-  if (allowAllForSession) {
-    statusBarItem.text = `$(unlock) Claude Permissions (auto)`;
-    statusBarItem.tooltip = 'Auto-approving all requests — click to show logs';
-  } else if (pending > 0) {
-    statusBarItem.text = `$(shield) Claude Permissions (${pending})`;
-    statusBarItem.tooltip = `${pending} pending permission request(s) — click to show logs`;
-  } else {
-    statusBarItem.text = '$(shield) Claude Permissions';
-    statusBarItem.tooltip = 'Claude Permission Popup is active — click to show logs';
+  statusBarItem.text = '$(shield) Claude Permissions';
+  statusBarItem.tooltip = 'Claude Permission Popup is active — click to show logs';
+  statusBarItem.command = 'claudePermissionPopup.showLogs';
+  statusBarItem.backgroundColor = undefined;
+}
+
+function flashStatusBarWarning(toolName) {
+  if (!statusBarItem) return;
+  statusBarItem.text = `$(bell) Permission needed: ${truncate(toolName, 30)}`;
+  statusBarItem.tooltip = 'Claude Code is waiting for permission — click to focus terminal';
+  statusBarItem.command = 'claudePermissionPopup.focusTerminal';
+  statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+
+  // Clear any existing decay timer
+  if (statusBarDecayTimer) {
+    clearTimeout(statusBarDecayTimer);
   }
+  // Auto-reset after 30 seconds
+  statusBarDecayTimer = setTimeout(() => {
+    resetStatusBar();
+  }, STATUS_BAR_DECAY_MS);
+}
+
+function resetStatusBar() {
+  if (statusBarDecayTimer) {
+    clearTimeout(statusBarDecayTimer);
+    statusBarDecayTimer = null;
+  }
+  updateStatusBar();
+}
+
+function sendOsNotification(title, message) {
+  const config = vscode.workspace.getConfiguration('claudePermissionPopup');
+  if (!config.get('osNotifications', true)) return;
+
+  try {
+    if (process.platform === 'darwin') {
+      execFile('osascript', ['-e', `display notification "${message}" with title "${title}"`], () => {});
+    } else if (process.platform === 'linux') {
+      execFile('notify-send', [title, message], () => {});
+    }
+    // Windows: no-op (VS Code notification is sufficient)
+  } catch {
+    // Best-effort — silently ignore errors
+  }
+}
+
+function handleNotification(data) {
+  const toolName = truncate(data.tool_name || 'Unknown tool', MAX_DISPLAY_LEN);
+  const toolInput = data.tool_input || {};
+  const detail = formatToolDetail(data.tool_name || '', toolInput);
+
+  log(`Permission notification for tool: ${toolName}`);
+
+  // Flash status bar yellow
+  flashStatusBarWarning(toolName);
+
+  // Show VS Code warning notification with "Show Terminal" button
+  vscode.window.showWarningMessage(
+    `Claude Code needs permission: ${toolName}`,
+    'Show Terminal'
+  ).then(choice => {
+    if (choice === 'Show Terminal') {
+      vscode.commands.executeCommand('workbench.action.terminal.focus');
+      resetStatusBar();
+    }
+  });
+
+  // Send OS-level notification
+  sendOsNotification('Claude Code Permission', `Waiting for approval: ${toolName}`);
+
+  // Bring VS Code to the foreground
+  vscode.commands.executeCommand('workbench.action.focusWindow');
+
+  log(`Notification detail: ${detail}`);
 }
 
 function formatToolDetail(toolName, toolInput) {
@@ -138,126 +198,9 @@ function verifyAuthToken(header, authToken) {
   return crypto.timingSafeEqual(expected, actual);
 }
 
-function processQueue() {
-  if (processing || requestQueue.length === 0) return;
-  processing = true;
-  const { data, res } = requestQueue.shift();
-  updateStatusBar();
-
-  const toolName = truncate(data.tool_name || 'Unknown tool', MAX_DISPLAY_LEN);
-  const toolInput = data.tool_input || {};
-  const detail = formatToolDetail(data.tool_name || '', toolInput);
-
-  // If "Allow All for Session" is active, auto-approve
-  if (allowAllForSession) {
-    log(`Auto-allowing (session override) tool: ${toolName}`);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ decision: 'allow' }));
-    processing = false;
-    updateStatusBar();
-    processQueue();
-    return;
-  }
-
-  log(`Showing QuickPick for tool: ${toolName}`);
-
-  const config = vscode.workspace.getConfiguration('claudePermissionPopup');
-  const timeoutMs = config.get('modalTimeout', DEFAULT_TIMEOUT_MS);
-
-  let resolved = false;
-  let timeoutHandle;
-
-  const qp = vscode.window.createQuickPick();
-  qp.title = `Claude wants to run: ${toolName}`;
-  qp.placeholder = detail;
-  qp.items = [
-    { label: '$(check) Allow', description: 'Permit this action', alwaysShow: true },
-    { label: '$(close) Deny', description: 'Block this action', alwaysShow: true },
-    { label: '$(unlock) Allow All for Session', description: 'Auto-approve all requests this session', alwaysShow: true },
-  ];
-  qp.ignoreFocusOut = true;
-  qp.show();
-
-  const quickPickPromise = new Promise(resolve => {
-    qp.onDidAccept(() => {
-      const selected = qp.selectedItems[0];
-      qp.dispose();
-      if (selected && selected.label.includes('Allow All')) {
-        resolve('Allow All for Session');
-      } else if (selected && selected.label.includes('Allow')) {
-        resolve('Allow');
-      } else {
-        resolve('Deny');
-      }
-    });
-    qp.onDidHide(() => {
-      qp.dispose();
-      resolve(undefined);
-    });
-  });
-
-  const timeoutPromise = new Promise(resolve => {
-    timeoutHandle = setTimeout(() => resolve('__timeout__'), timeoutMs);
-  });
-
-  Promise.race([quickPickPromise, timeoutPromise])
-    .then(choice => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeoutHandle);
-
-      let decision;
-      if (choice === 'Allow') {
-        decision = 'allow';
-      } else if (choice === 'Deny') {
-        decision = 'deny';
-      } else if (choice === 'Allow All for Session') {
-        decision = 'allow';
-        allowAllForSession = true;
-        log('Allow All for Session enabled — auto-approving subsequent requests');
-        updateStatusBar();
-        vscode.window.showInformationMessage(
-          'Claude Permission Popup: Auto-approving all requests for this session. Use "Revoke Allow All" to stop.'
-        );
-      } else if (choice === '__timeout__') {
-        decision = 'dismissed';
-        log('QuickPick timed out, returning dismissed');
-        qp.hide();
-        vscode.window.showInformationMessage('Claude permission request timed out.');
-      } else {
-        // undefined = Escape pressed or QuickPick dismissed
-        decision = 'dismissed';
-        log('QuickPick dismissed (Escape), returning dismissed');
-      }
-      log(`Decision for ${toolName}: ${decision}`);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ decision }));
-    })
-    .then(
-      () => { processing = false; updateStatusBar(); processQueue(); },
-      (err) => { log(`Error processing QuickPick: ${err}`); processing = false; updateStatusBar(); processQueue(); }
-    );
-}
-
 function truncate(str, max) {
   if (typeof str !== 'string') return String(str).slice(0, max);
   return str.length > max ? str.slice(0, max) + '...' : str;
-}
-
-/**
- * Dismiss all pending queued requests with 'dismissed' so Claude Code doesn't hang.
- */
-function drainQueue() {
-  while (requestQueue.length > 0) {
-    const { res } = requestQueue.shift();
-    try {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ decision: 'dismissed' }));
-    } catch (err) {
-      log(`Error draining queued request: ${err.message}`);
-    }
-  }
-  updateStatusBar();
 }
 
 /**
@@ -379,7 +322,7 @@ function createHttpServer(authToken) {
       return;
     }
 
-    if (req.method !== 'POST' || req.url !== '/permission') {
+    if (req.method !== 'POST' || req.url !== '/notify') {
       res.writeHead(404);
       res.end();
       return;
@@ -389,7 +332,7 @@ function createHttpServer(authToken) {
     if (!checkRateLimit()) {
       log('Rate limit exceeded');
       res.writeHead(429, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ decision: 'deny', error: 'Rate limit exceeded' }));
+      res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
       return;
     }
 
@@ -418,18 +361,13 @@ function createHttpServer(authToken) {
         return;
       }
 
-      // Throttle: reject if queue is full
-      if (requestQueue.length >= MAX_QUEUE) {
-        log('Queue full, returning deny');
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ decision: 'deny', error: 'Too many pending requests' }));
-        return;
-      }
+      log(`Received notification for tool: ${data.tool_name || 'Unknown'}`);
 
-      log(`Queued permission request for tool: ${data.tool_name || 'Unknown'} (queue size: ${requestQueue.length + 1})`);
-      requestQueue.push({ data, res });
-      updateStatusBar();
-      processQueue();
+      // Fire-and-forget: respond immediately, then show notification
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'notified' }));
+
+      handleNotification(data);
     });
   });
 }
@@ -476,9 +414,6 @@ function startServer(authToken, listenPort, context) {
 }
 
 function activate(context) {
-  // Reset session state
-  allowAllForSession = false;
-
   // Create output channel for logging
   outputChannel = vscode.window.createOutputChannel('Claude Permission Popup');
   context.subscriptions.push(outputChannel);
@@ -497,26 +432,19 @@ function activate(context) {
   });
   context.subscriptions.push(installHookCmd);
 
-  // Register revoke-allow-all command [Security Fix: Finding 10]
-  const revokeCmd = vscode.commands.registerCommand('claudePermissionPopup.revokeAllowAll', () => {
-    if (allowAllForSession) {
-      allowAllForSession = false;
-      updateStatusBar();
-      log('Allow All for Session revoked by user');
-      vscode.window.showInformationMessage('Claude Permission Popup: Auto-approve disabled. Permission prompts restored.');
-    } else {
-      vscode.window.showInformationMessage('Claude Permission Popup: Auto-approve is not currently active.');
-    }
+  // Register focus-terminal command
+  const focusTerminalCmd = vscode.commands.registerCommand('claudePermissionPopup.focusTerminal', () => {
+    vscode.commands.executeCommand('workbench.action.terminal.focus');
+    resetStatusBar();
   });
-  context.subscriptions.push(revokeCmd);
+  context.subscriptions.push(focusTerminalCmd);
 
   // Create status bar item — clickable, opens logs
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBarItem.text = '$(shield) Claude Permissions';
-  statusBarItem.tooltip = 'Claude Permission Popup is starting...';
   statusBarItem.command = 'claudePermissionPopup.showLogs';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+  updateStatusBar();
 
   const config = vscode.workspace.getConfiguration('claudePermissionPopup');
   const configPort = config.get('port', 0);
@@ -568,7 +496,7 @@ function activate(context) {
 
   context.subscriptions.push({
     dispose() {
-      drainQueue();
+      resetStatusBar();
       if (server) {
         server.close();
         server = null;
@@ -648,7 +576,7 @@ function cleanupRuntimeFiles() {
 }
 
 function deactivate() {
-  drainQueue();
+  resetStatusBar();
   if (server) {
     server.close();
     server = null;
