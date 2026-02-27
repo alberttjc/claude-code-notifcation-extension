@@ -22,8 +22,40 @@ function check(name, ok) {
 }
 
 // ─── Mock vscode module ─────────────────────────────────────────────
-let lastWarningMessage = null;
-let warningAutoReply = 'Allow';
+let lastQuickPickTitle = null;
+let quickPickAutoReply = 'Allow'; // 'Allow', 'Deny', 'Allow All for Session', or null (dismiss)
+
+function createMockQuickPick() {
+  let onAcceptCb = null;
+  let onHideCb = null;
+  const qp = {
+    title: '',
+    placeholder: '',
+    items: [],
+    selectedItems: [],
+    ignoreFocusOut: false,
+    show() {
+      lastQuickPickTitle = qp.title;
+      // Simulate user selection asynchronously
+      if (quickPickAutoReply === null) {
+        // Simulate dismiss (Escape)
+        setTimeout(() => { if (onHideCb) onHideCb(); }, 0);
+      } else {
+        setTimeout(() => {
+          // Find the matching item
+          const match = qp.items.find(i => i.label.includes(quickPickAutoReply));
+          qp.selectedItems = match ? [match] : [];
+          if (onAcceptCb) onAcceptCb();
+        }, 0);
+      }
+    },
+    hide() { if (onHideCb) onHideCb(); },
+    dispose() {},
+    onDidAccept(cb) { onAcceptCb = cb; },
+    onDidHide(cb) { onHideCb = cb; },
+  };
+  return qp;
+}
 
 const vscodeMock = {
   StatusBarAlignment: { Left: 1, Right: 2 },
@@ -32,25 +64,33 @@ const vscodeMock = {
       get: (_key, def) => def,   // port = 0 (random), modalTimeout = default
     }),
     onDidChangeConfiguration: (_cb) => ({ dispose: () => {} }),
+    workspaceFolders: null,
   },
   commands: {
     executeCommand: () => Promise.resolve(),
+    registerCommand: (_id, _cb) => ({ dispose: () => {} }),
   },
   window: {
-    showWarningMessage: (msg, _opts, ...buttons) => {
-      lastWarningMessage = msg;
-      return Promise.resolve(warningAutoReply);
+    createQuickPick: () => createMockQuickPick(),
+    showWarningMessage: (msg, ...args) => {
+      // Still used for server error messages, not for permission dialogs
+      return Promise.resolve();
     },
     showErrorMessage: (msg) => {
       console.log(`  [vscode.error] ${msg}`);
     },
+    showInformationMessage: (msg) => {
+      return Promise.resolve();
+    },
     createOutputChannel: (_name) => ({
       appendLine: () => {},
+      show: () => {},
       dispose: () => {},
     }),
     createStatusBarItem: (_alignment, _priority) => ({
       text: '',
       tooltip: '',
+      command: '',
       show: () => {},
       hide: () => {},
       dispose: () => {},
@@ -77,13 +117,13 @@ require.cache['vscode'] = {
 const ext = require('./extension');
 
 // ─── Helpers ────────────────────────────────────────────────────────
-function request(port, token, headers, body) {
+function request(port, token, headers, body, method, urlPath) {
   return new Promise((resolve) => {
     const opts = {
       hostname: '127.0.0.1',
       port,
-      path: '/permission',
-      method: 'POST',
+      path: urlPath || '/permission',
+      method: method || 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...headers,
@@ -126,7 +166,11 @@ function sleep(ms) {
   // Wait for server to start and write runtime files
   await sleep(500);
 
-  const runtimeDir = path.join(os.tmpdir(), 'claude-permission-popup-' + ext.getRuntimeUser());
+  // Match extension's getRuntimeBase() logic: prefer XDG_RUNTIME_DIR
+  const runtimeBase = (process.env.XDG_RUNTIME_DIR && fs.existsSync(process.env.XDG_RUNTIME_DIR))
+    ? process.env.XDG_RUNTIME_DIR
+    : os.tmpdir();
+  const runtimeDir = path.join(runtimeBase, 'claude-permission-popup-' + ext.getRuntimeUser());
   const portFile = path.join(runtimeDir, 'port');
   const tokenFile = path.join(runtimeDir, 'auth-token');
 
@@ -145,21 +189,28 @@ function sleep(ms) {
     'Authorization': `Bearer ${authToken}`,
   };
 
+  // ── Test: health check endpoint ────────────────────────────────
+  console.log('\n--- Health check endpoint ---');
+  const rHealth = await request(port, authToken, {}, undefined, 'GET', '/health');
+  check('health status 200', rHealth.status === 200);
+  check('health returns ok', rHealth.json && rHealth.json.status === 'ok');
+  check('health does not leak queue state', rHealth.json && rHealth.json.queue === undefined);
+
   // ── Test: valid request -> allow ─────────────────────────────────
   console.log('\n--- Valid request ---');
-  warningAutoReply = 'Allow';
+  quickPickAutoReply = 'Allow';
   const r1 = await request(port, authToken, authHeaders, {
     tool_name: 'Bash',
     tool_input: { command: 'ls -la' },
   });
   check('status 200', r1.status === 200);
   check('decision is allow', r1.json && r1.json.decision === 'allow');
-  check('showWarningMessage was called', lastWarningMessage !== null);
-  check('message mentions tool name', lastWarningMessage && lastWarningMessage.includes('Bash'));
+  check('createQuickPick was called', lastQuickPickTitle !== null);
+  check('title mentions tool name', lastQuickPickTitle && lastQuickPickTitle.includes('Bash'));
 
   // ── Test: deny decision ──────────────────────────────────────────
   console.log('\n--- Deny decision ---');
-  warningAutoReply = 'Deny';
+  quickPickAutoReply = 'Deny';
   const r1b = await request(port, authToken, authHeaders, {
     tool_name: 'Write',
     tool_input: { file_path: '/etc/passwd' },
@@ -197,11 +248,33 @@ function sleep(ms) {
 
   // ── Test: queue overflow -> 429 ──────────────────────────────────
   console.log('\n--- Queue overflow (>10 concurrent) ---');
-  // Make showWarningMessage resolve after a short delay (to keep queue full long enough)
+  // Make createQuickPick hang (never call onDidAccept/onDidHide) to keep queue full
   const hangingResolvers = [];
-  vscodeMock.window.showWarningMessage = (msg, _opts, ...buttons) => {
-    lastWarningMessage = msg;
-    return new Promise((resolve) => { hangingResolvers.push(resolve); });
+  vscodeMock.window.createQuickPick = () => {
+    let onAcceptCb = null;
+    let onHideCb = null;
+    const qp = {
+      title: '', placeholder: '', items: [], selectedItems: [],
+      ignoreFocusOut: false,
+      show() {
+        lastQuickPickTitle = qp.title;
+        // Don't auto-resolve — hang until manually drained
+        hangingResolvers.push((reply) => {
+          if (reply === null) {
+            if (onHideCb) onHideCb();
+          } else {
+            const match = qp.items.find(i => i.label.includes(reply));
+            qp.selectedItems = match ? [match] : [];
+            if (onAcceptCb) onAcceptCb();
+          }
+        });
+      },
+      hide() { if (onHideCb) onHideCb(); },
+      dispose() {},
+      onDidAccept(cb) { onAcceptCb = cb; },
+      onDidHide(cb) { onHideCb = cb; },
+    };
+    return qp;
   };
 
   // Fire 12 concurrent requests — first goes to processing, next 10 fill the queue, #12 should get 429
@@ -211,12 +284,14 @@ function sleep(ms) {
       tool_name: `QueueTest-${i}`,
       tool_input: {},
     }));
+    // Small stagger to avoid hitting rate limit
+    await sleep(50);
   }
 
   // Wait for all requests to reach the server and the 429 to be sent
   await sleep(500);
 
-  // Drain: resolve hanging modals in a loop until all pending requests complete
+  // Drain: resolve hanging QuickPicks in a loop until all pending requests complete
   const drainInterval = setInterval(() => {
     while (hangingResolvers.length > 0) {
       hangingResolvers.shift()('Allow');
@@ -232,10 +307,8 @@ function sleep(ms) {
   // ── Test: hook script end-to-end ─────────────────────────────────
   console.log('\n--- Hook script integration ---');
   // Reset the mock to auto-allow (instant resolve)
-  vscodeMock.window.showWarningMessage = (msg, _opts, ...buttons) => {
-    lastWarningMessage = msg;
-    return Promise.resolve('Allow');
-  };
+  vscodeMock.window.createQuickPick = () => createMockQuickPick();
+  quickPickAutoReply = 'Allow';
   // Wait for any remaining queued requests to drain
   await sleep(500);
 
@@ -293,6 +366,13 @@ function sleep(ms) {
     fmt('Read', { file_path: '/a.txt', limit: 50 }) === '/a.txt (lines 1–50)');
   check('Read: no offset/limit shows path only',
     fmt('Read', { file_path: '/a.txt' }) === '/a.txt');
+
+  // ── Test: truncate utility ──────────────────────────────────────
+  console.log('\n--- Truncate utility ---');
+  const trunc = ext.truncate;
+  check('truncate: short string unchanged', trunc('hello', 10) === 'hello');
+  check('truncate: long string cut', trunc('hello world', 5) === 'hello...');
+  check('truncate: non-string coerced', trunc(123, 10) === '123');
 
   // ── Cleanup: deactivate ──────────────────────────────────────────
   console.log('\n--- Deactivate & cleanup ---');

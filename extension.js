@@ -9,15 +9,21 @@ const MAX_BODY = 1024 * 1024; // 1 MB
 const MAX_QUEUE = 10;
 const MAX_DISPLAY_LEN = 500;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const RATE_LIMIT_WINDOW_MS = 1000;
+const RATE_LIMIT_MAX = 5;
 
 let server = null;
 let runtimeDir = null;
 let outputChannel = null;
 let statusBarItem = null;
+let allowAllForSession = false;
 
 // Permission request queue — processes one dialog at a time
 const requestQueue = [];
 let processing = false;
+
+// Rate limiting state
+const rateLimitTimestamps = [];
 
 function getRuntimeUser() {
   if (process.env.USER) return process.env.USER;
@@ -35,12 +41,15 @@ function log(message) {
 function updateStatusBar() {
   if (!statusBarItem) return;
   const pending = requestQueue.length + (processing ? 1 : 0);
-  if (pending > 0) {
+  if (allowAllForSession) {
+    statusBarItem.text = `$(unlock) Claude Permissions (auto)`;
+    statusBarItem.tooltip = 'Auto-approving all requests — click to show logs';
+  } else if (pending > 0) {
     statusBarItem.text = `$(shield) Claude Permissions (${pending})`;
-    statusBarItem.tooltip = `${pending} pending permission request(s)`;
+    statusBarItem.tooltip = `${pending} pending permission request(s) — click to show logs`;
   } else {
     statusBarItem.text = '$(shield) Claude Permissions';
-    statusBarItem.tooltip = 'Claude Permission Popup is active';
+    statusBarItem.tooltip = 'Claude Permission Popup is active — click to show logs';
   }
 }
 
@@ -99,6 +108,36 @@ function formatToolDetail(toolName, toolInput) {
   }
 }
 
+/**
+ * Check per-second rate limit. Returns true if the request should be allowed.
+ */
+function checkRateLimit() {
+  const now = Date.now();
+  // Remove timestamps outside the window
+  while (rateLimitTimestamps.length > 0 && rateLimitTimestamps[0] <= now - RATE_LIMIT_WINDOW_MS) {
+    rateLimitTimestamps.shift();
+  }
+  if (rateLimitTimestamps.length >= RATE_LIMIT_MAX) {
+    return false;
+  }
+  rateLimitTimestamps.push(now);
+  return true;
+}
+
+/**
+ * Timing-safe comparison of the Authorization header against the expected token.
+ * Prevents timing side-channel attacks on localhost where network jitter is minimal.
+ * [Security Fix: Finding 3]
+ */
+function verifyAuthToken(header, authToken) {
+  const expected = Buffer.from(`Bearer ${authToken}`);
+  const actual = Buffer.from(header || '');
+  if (expected.length !== actual.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(expected, actual);
+}
+
 function processQueue() {
   if (processing || requestQueue.length === 0) return;
   processing = true;
@@ -108,26 +147,63 @@ function processQueue() {
   const toolName = truncate(data.tool_name || 'Unknown tool', MAX_DISPLAY_LEN);
   const toolInput = data.tool_input || {};
   const detail = formatToolDetail(data.tool_name || '', toolInput);
-  const message = `Claude wants to run: ${toolName}\n\n${detail}`;
 
-  log(`Showing modal for tool: ${toolName}`);
+  // If "Allow All for Session" is active, auto-approve
+  if (allowAllForSession) {
+    log(`Auto-allowing (session override) tool: ${toolName}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ decision: 'allow' }));
+    processing = false;
+    updateStatusBar();
+    processQueue();
+    return;
+  }
+
+  log(`Showing QuickPick for tool: ${toolName}`);
 
   const config = vscode.workspace.getConfiguration('claudePermissionPopup');
   const timeoutMs = config.get('modalTimeout', DEFAULT_TIMEOUT_MS);
 
-  let modalResolved = false;
+  let resolved = false;
   let timeoutHandle;
 
-  const modalPromise = vscode.window.showWarningMessage(message, { modal: true }, 'Allow', 'Deny');
+  const qp = vscode.window.createQuickPick();
+  qp.title = `Claude wants to run: ${toolName}`;
+  qp.placeholder = detail;
+  qp.items = [
+    { label: '$(check) Allow', description: 'Permit this action', alwaysShow: true },
+    { label: '$(close) Deny', description: 'Block this action', alwaysShow: true },
+    { label: '$(unlock) Allow All for Session', description: 'Auto-approve all requests this session', alwaysShow: true },
+  ];
+  qp.ignoreFocusOut = true;
+  qp.show();
+
+  const quickPickPromise = new Promise(resolve => {
+    qp.onDidAccept(() => {
+      const selected = qp.selectedItems[0];
+      qp.dispose();
+      if (selected && selected.label.includes('Allow All')) {
+        resolve('Allow All for Session');
+      } else if (selected && selected.label.includes('Allow')) {
+        resolve('Allow');
+      } else {
+        resolve('Deny');
+      }
+    });
+    qp.onDidHide(() => {
+      qp.dispose();
+      resolve(undefined);
+    });
+  });
 
   const timeoutPromise = new Promise(resolve => {
     timeoutHandle = setTimeout(() => resolve('__timeout__'), timeoutMs);
   });
 
-  Promise.race([modalPromise, timeoutPromise])
+  Promise.race([quickPickPromise, timeoutPromise])
     .then(choice => {
-      if (modalResolved) return;
-      modalResolved = true;
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeoutHandle);
 
       let decision;
@@ -135,15 +211,23 @@ function processQueue() {
         decision = 'allow';
       } else if (choice === 'Deny') {
         decision = 'deny';
+      } else if (choice === 'Allow All for Session') {
+        decision = 'allow';
+        allowAllForSession = true;
+        log('Allow All for Session enabled — auto-approving subsequent requests');
+        updateStatusBar();
+        vscode.window.showInformationMessage(
+          'Claude Permission Popup: Auto-approving all requests for this session. Use "Revoke Allow All" to stop.'
+        );
       } else if (choice === '__timeout__') {
         decision = 'dismissed';
-        log('Modal timed out, returning dismissed');
-        // Show a non-modal notification to dismiss the stale modal
+        log('QuickPick timed out, returning dismissed');
+        qp.hide();
         vscode.window.showInformationMessage('Claude permission request timed out.');
       } else {
-        // undefined = Escape pressed or modal dismissed
+        // undefined = Escape pressed or QuickPick dismissed
         decision = 'dismissed';
-        log('Modal dismissed (Escape), returning dismissed');
+        log('QuickPick dismissed (Escape), returning dismissed');
       }
       log(`Decision for ${toolName}: ${decision}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -151,7 +235,7 @@ function processQueue() {
     })
     .then(
       () => { processing = false; updateStatusBar(); processQueue(); },
-      (err) => { log(`Error processing modal: ${err}`); processing = false; updateStatusBar(); processQueue(); }
+      (err) => { log(`Error processing QuickPick: ${err}`); processing = false; updateStatusBar(); processQueue(); }
     );
 }
 
@@ -160,37 +244,125 @@ function truncate(str, max) {
   return str.length > max ? str.slice(0, max) + '...' : str;
 }
 
-function activate(context) {
-  // Create output channel for logging
-  outputChannel = vscode.window.createOutputChannel('Claude Permission Popup');
-  context.subscriptions.push(outputChannel);
+/**
+ * Dismiss all pending queued requests with 'dismissed' so Claude Code doesn't hang.
+ */
+function drainQueue() {
+  while (requestQueue.length > 0) {
+    const { res } = requestQueue.shift();
+    try {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ decision: 'dismissed' }));
+    } catch (err) {
+      log(`Error draining queued request: ${err.message}`);
+    }
+  }
+  updateStatusBar();
+}
 
-  // Create status bar item
-  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBarItem.text = '$(shield) Claude Permissions';
-  statusBarItem.tooltip = 'Claude Permission Popup is active';
-  statusBarItem.show();
-  context.subscriptions.push(statusBarItem);
+/**
+ * Validate ownership of the runtime directory.
+ * Returns true if safe to use, false otherwise.
+ */
+function validateRuntimeDir(dirPath) {
+  try {
+    const stat = fs.lstatSync(dirPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      log('Runtime directory is a symlink or not a directory');
+      return false;
+    }
+    // Check ownership if getuid is available (Unix)
+    if (typeof process.getuid === 'function') {
+      if (stat.uid !== process.getuid()) {
+        log(`Runtime directory owned by uid ${stat.uid}, expected ${process.getuid()}`);
+        return false;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const config = vscode.workspace.getConfiguration('claudePermissionPopup');
-  const configPort = config.get('port', 0);
-
-  // Generate a shared secret for authentication
-  const authToken = crypto.randomBytes(32).toString('hex');
-
-  // Determine runtime directory for port/token files
-  runtimeDir = path.join(os.tmpdir(), 'claude-permission-popup-' + getRuntimeUser());
-  fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
-
-  // Guard against symlink attacks on the runtime directory
-  const runtimeDirStat = fs.lstatSync(runtimeDir);
-  if (!runtimeDirStat.isDirectory() || runtimeDirStat.isSymbolicLink()) {
-    vscode.window.showErrorMessage('Claude Permission Popup: Runtime directory is a symlink or not a directory');
-    log('Aborting: runtime directory is a symlink');
-    return;
+/**
+ * Safely write a file into the runtime directory with re-validation.
+ * Re-checks directory integrity immediately before each write to close the
+ * TOCTOU gap between initial validation and file creation.
+ * [Security Fix: Findings 1 & 2]
+ */
+function safeWriteRuntimeFile(filename, content) {
+  // Re-validate the runtime directory right before writing
+  if (!validateRuntimeDir(runtimeDir)) {
+    throw new Error('Runtime directory validation failed before write');
   }
 
-  server = http.createServer((req, res) => {
+  // Resolve the real path to detect symlinks on the file itself
+  // Use the directory's real path, not the potentially-symlinked one
+  const realDir = fs.realpathSync(runtimeDir);
+  const realFilePath = path.join(realDir, filename);
+
+  // Ensure the resolved path is still within the expected directory
+  if (!realFilePath.startsWith(realDir + path.sep) && realFilePath !== realDir) {
+    throw new Error('Runtime file path escapes runtime directory');
+  }
+
+  // Write with restricted permissions using the resolved path
+  fs.writeFileSync(realFilePath, content, { mode: 0o600 });
+}
+
+/**
+ * Clean up stale runtime files from a previous crash.
+ */
+function cleanupStaleRuntimeFiles(dirPath) {
+  const portFile = path.join(dirPath, 'port');
+  const tokenFile = path.join(dirPath, 'auth-token');
+  let cleaned = false;
+  if (fs.existsSync(portFile)) {
+    try { fs.unlinkSync(portFile); cleaned = true; } catch {}
+  }
+  if (fs.existsSync(tokenFile)) {
+    try { fs.unlinkSync(tokenFile); cleaned = true; } catch {}
+  }
+  if (cleaned) {
+    log('Cleaned up stale runtime files from a previous session');
+  }
+}
+
+/**
+ * Determine the best runtime directory base path.
+ * Prefers XDG_RUNTIME_DIR (per-user, not world-readable) over TMPDIR/tmp.
+ * [Security Fix: Finding 5]
+ */
+function getRuntimeBase() {
+  // XDG_RUNTIME_DIR is per-user, mode 0700, and managed by the OS
+  if (process.env.XDG_RUNTIME_DIR) {
+    try {
+      const stat = fs.statSync(process.env.XDG_RUNTIME_DIR);
+      if (stat.isDirectory()) {
+        return process.env.XDG_RUNTIME_DIR;
+      }
+    } catch {}
+  }
+  return os.tmpdir();
+}
+
+function createHttpServer(authToken) {
+  return http.createServer((req, res) => {
+    // Health check endpoint — no auth required but no state leaked
+    // [Security Fix: Finding 4]
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
+    // Deny CORS preflight explicitly [Security Fix: Finding 8]
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     // Require custom header to block browser cross-origin requests
     if (req.headers['x-claude-permission'] !== 'true') {
       log('Rejected request: missing x-claude-permission header');
@@ -199,8 +371,8 @@ function activate(context) {
       return;
     }
 
-    // Validate auth token
-    if (req.headers['authorization'] !== `Bearer ${authToken}`) {
+    // Validate auth token using timing-safe comparison [Security Fix: Finding 3]
+    if (!verifyAuthToken(req.headers['authorization'], authToken)) {
       log('Rejected request: invalid auth token');
       res.writeHead(401);
       res.end(JSON.stringify({ error: 'Unauthorized' }));
@@ -213,6 +385,14 @@ function activate(context) {
       return;
     }
 
+    // Per-second rate limiting
+    if (!checkRateLimit()) {
+      log('Rate limit exceeded');
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ decision: 'deny', error: 'Rate limit exceeded' }));
+      return;
+    }
+
     // Enforce body size limit
     let body = '';
     let aborted = false;
@@ -222,7 +402,7 @@ function activate(context) {
         aborted = true;
         res.writeHead(413);
         res.end(JSON.stringify({ error: 'Request body too large' }));
-        req.destroy(); // discard remaining data
+        req.destroy();
       }
     });
 
@@ -238,7 +418,7 @@ function activate(context) {
         return;
       }
 
-      // Throttle: reject if queue is full — return explicit deny
+      // Throttle: reject if queue is full
       if (requestQueue.length >= MAX_QUEUE) {
         log('Queue full, returning deny');
         res.writeHead(429, { 'Content-Type': 'application/json' });
@@ -252,28 +432,123 @@ function activate(context) {
       processQueue();
     });
   });
+}
 
-  // Use port 0 to get a random available port, unless user configured one
-  const listenPort = configPort || 0;
+function startServer(authToken, listenPort, context) {
+  server = createHttpServer(authToken);
 
   server.listen(listenPort, '127.0.0.1', () => {
     const actualPort = server.address().port;
     log(`Server listening on 127.0.0.1:${actualPort}`);
 
-    // Write port and auth token to files for the hook script to read
+    // Write port and auth token with re-validation before each write
+    // [Security Fix: Findings 1 & 2]
     try {
-      fs.writeFileSync(path.join(runtimeDir, 'port'), String(actualPort), { mode: 0o600 });
-      fs.writeFileSync(path.join(runtimeDir, 'auth-token'), authToken, { mode: 0o600 });
+      safeWriteRuntimeFile('port', String(actualPort));
+      safeWriteRuntimeFile('auth-token', authToken);
     } catch (err) {
-      vscode.window.showErrorMessage(`Claude Permission Popup: Failed to write runtime files: ${err.code || 'UNKNOWN'}`);
+      vscode.window.showErrorMessage(`Claude Permission Popup: Failed to write runtime files: ${err.code || err.message}`);
       log(`Failed to write runtime files: ${err.message}`);
     }
+
+    // Show activation notification
+    statusBarItem.text = '$(shield) Claude Permissions';
+    statusBarItem.tooltip = `Claude Permission Popup is active on port ${actualPort} — click to show logs`;
+    log(`Extension activated successfully on port ${actualPort}`);
   });
 
   server.on('error', (err) => {
-    vscode.window.showErrorMessage(`Claude Permission Popup: Failed to start server: ${err.code || 'UNKNOWN'}`);
     log(`Server error: ${err.message}`);
+    if (server) {
+      vscode.window.showWarningMessage(
+        `Claude Permission Popup: Server error (${err.code || 'UNKNOWN'}). Attempting restart...`
+      );
+      log('Attempting server restart...');
+      try { server.close(); } catch {}
+      server = null;
+      setTimeout(() => {
+        if (!server) {
+          startServer(authToken, listenPort, context);
+        }
+      }, 1000);
+    }
   });
+}
+
+function activate(context) {
+  // Reset session state
+  allowAllForSession = false;
+
+  // Create output channel for logging
+  outputChannel = vscode.window.createOutputChannel('Claude Permission Popup');
+  context.subscriptions.push(outputChannel);
+
+  // Register show-logs command
+  const showLogsCmd = vscode.commands.registerCommand('claudePermissionPopup.showLogs', () => {
+    if (outputChannel) {
+      outputChannel.show();
+    }
+  });
+  context.subscriptions.push(showLogsCmd);
+
+  // Register install-hook command
+  const installHookCmd = vscode.commands.registerCommand('claudePermissionPopup.installHook', async () => {
+    await installHook();
+  });
+  context.subscriptions.push(installHookCmd);
+
+  // Register revoke-allow-all command [Security Fix: Finding 10]
+  const revokeCmd = vscode.commands.registerCommand('claudePermissionPopup.revokeAllowAll', () => {
+    if (allowAllForSession) {
+      allowAllForSession = false;
+      updateStatusBar();
+      log('Allow All for Session revoked by user');
+      vscode.window.showInformationMessage('Claude Permission Popup: Auto-approve disabled. Permission prompts restored.');
+    } else {
+      vscode.window.showInformationMessage('Claude Permission Popup: Auto-approve is not currently active.');
+    }
+  });
+  context.subscriptions.push(revokeCmd);
+
+  // Create status bar item — clickable, opens logs
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.text = '$(shield) Claude Permissions';
+  statusBarItem.tooltip = 'Claude Permission Popup is starting...';
+  statusBarItem.command = 'claudePermissionPopup.showLogs';
+  statusBarItem.show();
+  context.subscriptions.push(statusBarItem);
+
+  const config = vscode.workspace.getConfiguration('claudePermissionPopup');
+  const configPort = config.get('port', 0);
+
+  // Generate a shared secret for authentication
+  const authToken = crypto.randomBytes(32).toString('hex');
+
+  // Determine runtime directory using XDG_RUNTIME_DIR when available [Security Fix: Finding 5]
+  const runtimeBase = getRuntimeBase();
+  runtimeDir = path.join(runtimeBase, 'claude-permission-popup-' + getRuntimeUser());
+  fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+
+  // Enforce permissions even if directory was pre-created by another process [Security Fix: Finding 5]
+  try {
+    fs.chmodSync(runtimeDir, 0o700);
+  } catch (err) {
+    log(`Warning: Could not set runtime directory permissions: ${err.message}`);
+  }
+
+  // Validate runtime directory (symlink + ownership check)
+  if (!validateRuntimeDir(runtimeDir)) {
+    vscode.window.showErrorMessage('Claude Permission Popup: Runtime directory is a symlink, not a directory, or owned by another user');
+    log('Aborting: runtime directory validation failed');
+    return;
+  }
+
+  // Clean up stale runtime files from a previous crash
+  cleanupStaleRuntimeFiles(runtimeDir);
+
+  // Use port 0 to get a random available port, unless user configured one
+  const listenPort = configPort || 0;
+  startServer(authToken, listenPort, context);
 
   // Listen for configuration changes — prompt reload when port changes
   context.subscriptions.push(
@@ -293,6 +568,7 @@ function activate(context) {
 
   context.subscriptions.push({
     dispose() {
+      drainQueue();
       if (server) {
         server.close();
         server = null;
@@ -300,6 +576,68 @@ function activate(context) {
       cleanupRuntimeFiles();
     }
   });
+}
+
+/**
+ * Install the hook script into .claude/settings.json
+ */
+async function installHook() {
+  const hookScriptPath = path.join(__dirname, 'hooks', 'permission-request.sh');
+  if (!fs.existsSync(hookScriptPath)) {
+    vscode.window.showErrorMessage('Claude Permission Popup: Hook script not found at expected path.');
+    return;
+  }
+
+  // Find workspace folder or home directory
+  const targetDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+  const claudeDir = path.join(targetDir, '.claude');
+  const settingsPath = path.join(claudeDir, 'settings.json');
+
+  let settings = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch {
+      vscode.window.showErrorMessage('Claude Permission Popup: Failed to parse .claude/settings.json');
+      return;
+    }
+  }
+
+  if (!settings.hooks) {
+    settings.hooks = {};
+  }
+  if (!settings.hooks.PermissionRequest) {
+    settings.hooks.PermissionRequest = [];
+  }
+
+  const alreadyInstalled = settings.hooks.PermissionRequest.some(entry =>
+    entry.hooks && entry.hooks.some(h => h.command && h.command.includes('permission-request.sh'))
+  );
+
+  if (alreadyInstalled) {
+    vscode.window.showInformationMessage('Claude Permission Popup: Hook is already configured.');
+    return;
+  }
+
+  settings.hooks.PermissionRequest.push({
+    matcher: '',
+    hooks: [
+      {
+        type: 'command',
+        command: hookScriptPath
+      }
+    ]
+  });
+
+  try {
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+    vscode.window.showInformationMessage(`Claude Permission Popup: Hook installed in ${settingsPath}`);
+    log(`Hook installed in ${settingsPath}`);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Claude Permission Popup: Failed to write settings`);
+    log(`Failed to write settings: ${err.message}`);
+  }
 }
 
 function cleanupRuntimeFiles() {
@@ -310,6 +648,7 @@ function cleanupRuntimeFiles() {
 }
 
 function deactivate() {
+  drainQueue();
   if (server) {
     server.close();
     server = null;
@@ -317,4 +656,4 @@ function deactivate() {
   cleanupRuntimeFiles();
 }
 
-module.exports = { activate, deactivate, getRuntimeUser, formatToolDetail };
+module.exports = { activate, deactivate, getRuntimeUser, formatToolDetail, truncate };
