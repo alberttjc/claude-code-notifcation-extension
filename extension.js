@@ -296,8 +296,6 @@ function safeWriteRuntimeFile(filename, content) {
     throw new Error('Runtime directory validation failed before write');
   }
 
-  const filePath = path.join(runtimeDir, filename);
-
   // Resolve the real path to detect symlinks on the file itself
   // Use the directory's real path, not the potentially-symlinked one
   const realDir = fs.realpathSync(runtimeDir);

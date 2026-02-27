@@ -114,7 +114,7 @@ When Claude Code requests permission, a QuickPick dialog appears with three opti
 
 ### Reliability
 
-- **Health check endpoint** — `GET /health` returns `{ status: "ok", queue: N, processing: bool }`. The hook script checks this before sending requests for faster failure detection.
+- **Health check endpoint** — `GET /health` returns `{ status: "ok" }`. The hook script checks this before sending requests for faster failure detection.
 - **Graceful shutdown** — When the extension deactivates, all pending requests receive a `dismissed` response so Claude Code doesn't hang waiting.
 - **Server auto-restart** — If the HTTP server crashes unexpectedly, the extension waits 1 second and attempts to restart.
 - **Stale file cleanup** — On activation, detects and removes leftover runtime files from previous crashes.
@@ -190,7 +190,7 @@ The extension runs a local HTTP server with two endpoints:
 No authentication required. Returns server status.
 
 ```json
-{ "status": "ok", "queue": 0, "processing": false }
+{ "status": "ok" }
 ```
 
 ### `POST /permission`
