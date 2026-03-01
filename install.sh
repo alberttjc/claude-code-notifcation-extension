@@ -23,10 +23,11 @@ MARKER="# Claude Code webhook notification server"
 if grep -qF "$MARKER" "$PROFILE" 2>/dev/null; then
   echo "Already installed in $PROFILE — skipping."
 else
+  NOTIFY_PORT="${NOTIFY_PORT:-7777}"
   cat >> "$PROFILE" << EOF
 
 $MARKER
-if ! lsof -i :7777 &>/dev/null; then
+if ! lsof -i :${NOTIFY_PORT} &>/dev/null; then
   node "$SERVER_SCRIPT" &>/dev/null &
   disown
 fi
@@ -34,13 +35,15 @@ EOF
   echo "Added auto-start snippet to $PROFILE"
 fi
 
+NOTIFY_PORT="${NOTIFY_PORT:-7777}"
+
 # Start the server now if not already running
-if lsof -i :7777 &>/dev/null; then
-  echo "Server is already running on port 7777."
+if lsof -i :"$NOTIFY_PORT" &>/dev/null; then
+  echo "Server is already running on port $NOTIFY_PORT."
 else
   node "$SERVER_SCRIPT" &>/dev/null &
   disown
-  echo "Server started on port 7777."
+  echo "Server started on port $NOTIFY_PORT."
 fi
 
 echo "Done. New terminals will auto-start the server."

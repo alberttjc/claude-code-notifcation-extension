@@ -15,11 +15,12 @@ for PROFILE in "$HOME/.zshrc" "$HOME/.bashrc"; do
   fi
 done
 
-# Kill any running server on port 7777
-if lsof -i :7777 &>/dev/null; then
-  kill $(lsof -ti :7777) 2>/dev/null && echo "Stopped server on port 7777." || true
+# Kill the notification server by process name (avoids killing unrelated processes)
+PIDS=$(pgrep -f "node.*permission-notify" 2>/dev/null || true)
+if [ -n "$PIDS" ]; then
+  kill $PIDS 2>/dev/null && echo "Stopped notification server." || true
 else
-  echo "No server running on port 7777."
+  echo "No notification server running."
 fi
 
 echo "Done. Uninstalled."

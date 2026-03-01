@@ -16,9 +16,22 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
   let body = "";
-  req.on("data", (chunk) => (body += chunk.toString()));
+  let aborted = false;
+
+  req.on("data", (chunk) => {
+    body += chunk.toString();
+    if (body.length > MAX_BODY_SIZE) {
+      aborted = true;
+      res.writeHead(413, { "Content-Type": "text/plain" });
+      res.end("Payload too large");
+      req.destroy();
+    }
+  });
+
   req.on("end", () => {
+    if (aborted) return;
     let title = "Claude Code";
     let message = "Claude Code needs attention";
 
@@ -41,11 +54,15 @@ const server = http.createServer((req, res) => {
       // Use default message if JSON parsing fails
     }
 
+    // Truncate and strip control characters before passing to terminal-notifier
+    const sanitize = (str, max) =>
+      str.slice(0, max).replace(/[\x00-\x1f\x7f]/g, "");
+
     execFile("terminal-notifier", [
       "-title",
-      title,
+      sanitize(title, 100),
       "-message",
-      message,
+      sanitize(message, 200),
       "-sound",
       "default",
     ]);
