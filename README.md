@@ -2,6 +2,8 @@
 
 Local webhook server that triggers **macOS notifications** when Claude Code needs attention inside a Dev Container.
 
+![Claude Code webhook notification in action](image.png)
+
 **Flow:**
 ```
 Dev Container → host.docker.internal:7777 → macOS webhook → OS-level alert
