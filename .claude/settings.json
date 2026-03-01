@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt|elicitation_dialog",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat) && curl -s -X POST http://host.docker.internal:7777 -H 'Content-Type: application/json' -d \"$INPUT\" > /dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

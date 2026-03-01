@@ -1,78 +1,107 @@
-# Claude Code Permission Popup
+# Claude Code Webhook Notification
 
-A VS Code extension that shows interactive popup dialogs for Claude Code permission requests instead of terminal prompts.
+Local webhook server that triggers **macOS notifications** when Claude Code needs attention inside a Dev Container.
 
-## How It Works
-
-1. Claude Code triggers a permission hook when it wants to run a tool (e.g., Bash, Write, Edit)
-2. The hook script (`permission-request.sh`) first runs a health check, then sends the request to a local HTTP server run by the extension
-3. VS Code shows a QuickPick dialog with the tool name and details
-4. You select **Allow**, **Deny**, or **Allow All for Session**, and the decision flows back to Claude Code
-5. Pressing **Escape** dismisses the dialog and falls back to the terminal prompt
-
-The extension shows a clickable status bar indicator (`$(shield) Claude Permissions`) with the count of pending requests. Click it to open the logs. All activity is logged to the **Claude Permission Popup** output channel.
-
-If the extension isn't running, the hook silently exits and Claude Code falls back to its default terminal prompt.
-
-## Project Structure
-
+**Flow:**
 ```
-claude-permission-popup/
-├── package.json                            # Extension manifest and configuration
-├── extension.js                            # HTTP server + QuickPick dialog logic
-├── hooks/permission-request.sh             # Claude Code hook script (uses node + curl)
-├── icon.png                                # 128x128 extension icon
-├── test-smoke.js                           # Smoke tests (30 tests)
-├── .vscodeignore                           # Files excluded from packaged extension
-├── .eslintrc.json                          # ESLint configuration
-├── CHANGELOG.md                            # Version history
-└── LICENSE                                 # MIT License
+Dev Container → host.docker.internal:7777 → macOS webhook → OS-level alert
 ```
 
-## Installation
+## Compatibility
 
-### From .vsix
+**macOS only.** This project does not work on Windows or Linux because:
 
-1. Build the package:
+- **`terminal-notifier`** is a macOS-only notification tool (installed via Homebrew)
+- **`install.sh`** relies on macOS/Unix tooling (`lsof`, `disown`, `.zshrc`/`.bashrc`)
+- While `host.docker.internal` works on Docker Desktop for both macOS and Windows (so the networking layer is portable), the notification layer is not
 
-   ```sh
-   npm install
-   npx vsce package
-   ```
+## Prerequisites
 
-2. Install the extension:
-
-   ```sh
-   code --install-extension claude-permission-popup-0.1.0.vsix
-   ```
-
-3. Reload the VS Code window (`Ctrl+Shift+P` → "Developer: Reload Window")
-
-### From Extension Development Host
-
-1. Open the `claude-permission-popup/` folder in VS Code
-2. Press `F5` to launch the Extension Development Host
+- macOS host
+- Docker Desktop running
+- Node.js installed on your Mac
+- VS Code with Dev Containers
 
 ## Setup
 
-### Automatic (Recommended)
+### 1. Install terminal-notifier (macOS host)
 
-Run **Claude Permission Popup: Install Hook** from the Command Palette (`Ctrl+Shift+P`). This writes the hook configuration to your `.claude/settings.json` automatically.
+```bash
+brew install terminal-notifier
+```
 
-### Manual
+Verify it works:
 
-Add this to your `.claude/settings.json`:
+```bash
+terminal-notifier -title "Test" -message "If you see this, it works."
+```
+
+### 2. Configure macOS notification style
+
+1. Open **System Settings > Notifications**
+2. Find your terminal app (Terminal / iTerm)
+3. Set **Alert Style** to **Alerts** (not Banners) — this makes notifications persist until clicked
+
+### 3. Start the webhook server (macOS host)
+
+#### Auto-Start (Recommended)
+
+Run the install script once — it adds a snippet to your shell profile so the server starts automatically with every new terminal:
+
+```bash
+cd /path/to/claude-webhook-notification
+./install.sh
+```
+
+That's it. The server starts immediately and will auto-start in future terminals. To remove it later:
+
+```bash
+./uninstall.sh
+```
+
+#### Manual
+
+If you prefer to start it yourself each time:
+
+```bash
+cd /path/to/claude-webhook-notification
+npm start
+```
+
+Leave this terminal running while you work.
+
+### 4. Test from Dev Container
+
+Inside your dev container:
+
+```bash
+# Basic test (backward compatible)
+curl -X POST http://host.docker.internal:7777 \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Test notification"}'
+
+# Test with hook payload format
+curl -X POST http://host.docker.internal:7777 \
+  -H "Content-Type: application/json" \
+  -d '{"notification_type":"permission_prompt","title":"Permission needed","message":"Claude needs permission to use Bash"}'
+```
+
+You should see a macOS notification appear.
+
+### 5. Wire into Claude Code
+
+Copy `.claude/settings.json` to your project's `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "PermissionRequest": [
+    "Notification": [
       {
-        "matcher": "",
+        "matcher": "permission_prompt|idle_prompt|elicitation_dialog",
         "hooks": [
           {
             "type": "command",
-            "command": "/path/to/claude-permission-popup/hooks/permission-request.sh"
+            "command": "INPUT=$(cat) && curl -s -X POST http://host.docker.internal:7777 -H 'Content-Type: application/json' -d \"$INPUT\" > /dev/null 2>&1 || true"
           }
         ]
       }
@@ -81,168 +110,25 @@ Add this to your `.claude/settings.json`:
 }
 ```
 
-Replace `/path/to/` with the actual path to the extension source.
+The hook reads Claude Code's stdin JSON payload (which includes `notification_type`, `title`, `message`, etc.) and forwards it to the webhook server. The matcher ensures the hook only fires for permission prompts, idle prompts, and elicitation dialogs — not for every notification type.
+
+## Notification types
+
+| `notification_type` | Message shown |
+|---|---|
+| `permission_prompt` | Claude Code is waiting for permission |
+| `idle_prompt` | Claude Code is idle and waiting for input |
+| `elicitation_dialog` | Claude Code needs your input |
+| (unknown/missing) | Falls back to `message` field or "Claude Code needs attention" |
 
 ## Configuration
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudePermissionPopup.port` | `0` | Port for the local HTTP server. `0` = random available port, auto-discovered by the hook script. |
-| `claudePermissionPopup.modalTimeout` | `300000` | Timeout in ms for the permission dialog. Default: 5 minutes. If no response, the dialog is dismissed and Claude Code falls back to the terminal prompt. |
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `NOTIFY_PORT` | `7777` | Port the webhook server listens on |
 
-The port and auth token are shared automatically via runtime files in `/tmp/claude-permission-popup-$USER/`. No environment variables need to be set.
+## Troubleshooting
 
-## Commands
-
-| Command | Description |
-|---|---|
-| **Claude Permission Popup: Show Logs** | Opens the output channel with extension logs |
-| **Claude Permission Popup: Install Hook** | Auto-configures the hook in `.claude/settings.json` |
-| **Claude Permission Popup: Revoke Allow All** | Disables the "Allow All for Session" auto-approve mode and restores per-request prompts |
-
-All commands are available from the Command Palette (`Ctrl+Shift+P`).
-
-## Features
-
-### Permission Dialog
-
-When Claude Code requests permission, a QuickPick dialog appears with three options:
-
-- **Allow** — Permit this specific action
-- **Deny** — Block this specific action
-- **Allow All for Session** — Auto-approve all subsequent requests until the VS Code window is reloaded or **Claude Permission Popup: Revoke Allow All** is run
-
-### Reliability
-
-- **Health check endpoint** — `GET /health` returns `{ status: "ok" }`. The hook script checks this before sending requests for faster failure detection.
-- **Graceful shutdown** — When the extension deactivates, all pending requests receive a `dismissed` response so Claude Code doesn't hang waiting.
-- **Server auto-restart** — If the HTTP server crashes unexpectedly, the extension waits 1 second and attempts to restart.
-- **Stale file cleanup** — On activation, detects and removes leftover runtime files from previous crashes.
-
-### Security
-
-- **Auth token** — A random 64-character hex token is generated per session and required on all requests (`Authorization: Bearer <token>`)
-- **Custom header** — Requires `X-Claude-Permission: true` header to block browser cross-origin requests
-- **Body size limit** — Rejects request bodies larger than 1 MB (HTTP 413)
-- **Queue cap** — Maximum 10 pending requests; additional requests receive HTTP 429
-- **Per-second rate limiting** — Maximum 5 requests per second; excess requests receive HTTP 429
-- **Runtime directory validation** — Checks the runtime directory is not a symlink and is owned by the current user (`stat.uid`)
-- **Localhost only** — Server binds to `127.0.0.1`, never exposed to the network
-- **Untrusted workspaces** — Extension declares `untrustedWorkspaces.supported: false`
-
-## Testing
-
-### Smoke Tests
-
-Run the full test suite (30 tests):
-
-```sh
-npm test
-```
-
-Tests cover: health endpoint, allow/deny decisions, QuickPick UI, auth (403/401), body size limit (413), invalid JSON (400), queue overflow (429), hook script end-to-end, `formatToolDetail`, and `truncate`.
-
-### Manual Testing
-
-Verify the extension is running:
-
-```sh
-# Health check (no auth required)
-curl -s http://127.0.0.1:$(cat /tmp/claude-permission-popup-$USER/port)/health
-```
-
-Send a test permission request:
-
-```sh
-curl -s -X POST \
-  -H "Content-Type: application/json" \
-  -H "x-claude-permission: true" \
-  -H "Authorization: Bearer $(cat /tmp/claude-permission-popup-$USER/auth-token)" \
-  -d '{"tool_name":"Bash","tool_input":{"command":"echo hello"}}' \
-  "http://127.0.0.1:$(cat /tmp/claude-permission-popup-$USER/port)/permission"
-```
-
-A QuickPick dialog should appear in VS Code. Selecting Allow returns `{"decision":"allow"}`, Deny returns `{"decision":"deny"}`, Allow All for Session returns `{"decision":"allow"}` and enables auto-approve mode, and pressing Escape returns `{"decision":"dismissed"}`.
-
-Test the hook script directly:
-
-```sh
-echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | ./hooks/permission-request.sh
-```
-
-Check the **Output** panel → **Claude Permission Popup** for logs.
-
-## Hook Script Dependencies
-
-The hook script requires:
-
-- **node** — for JSON parsing (guaranteed available when VS Code is installed)
-- **curl** — for HTTP requests to the extension
-
-> **Note:** Previous versions required `python3`. As of v0.1.0, the hook script uses `node` instead.
-
-## HTTP API Reference
-
-The extension runs a local HTTP server with two endpoints:
-
-### `GET /health`
-
-No authentication required. Returns server status.
-
-```json
-{ "status": "ok" }
-```
-
-### `POST /permission`
-
-Requires `X-Claude-Permission: true` header and `Authorization: Bearer <token>` header.
-
-**Request body:**
-```json
-{
-  "tool_name": "Bash",
-  "tool_input": { "command": "echo hello" }
-}
-```
-
-**Response:**
-```json
-{ "decision": "allow" }
-```
-
-Possible `decision` values: `"allow"`, `"deny"`, `"dismissed"`.
-
-## Tool Detail Formatting
-
-The dialog shows tool-specific details:
-
-| Tool | Detail shown |
-|---|---|
-| **Bash** | Command to execute |
-| **Edit / MultiEdit** | File path + old/new string previews |
-| **Write** | File path + content preview |
-| **Grep** | Pattern + search path |
-| **Read** | File path + line range (e.g., "lines 10–29") |
-| **Other** | Command, file path, or truncated JSON |
-
-## Development
-
-```sh
-# Install dev dependencies
-npm install
-
-# Run linter
-npm run lint
-
-# Run tests
-npm test
-
-# Package for distribution
-npx vsce package
-```
-
-The `vscode:prepublish` script runs lint + tests automatically before packaging.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+- **No notification appears:** Check that `terminal-notifier` is installed and your terminal app has notification permissions in System Settings
+- **Can't reach server from container:** Ensure Docker Desktop is running — `host.docker.internal` is only available with Docker Desktop on macOS
+- **Notification disappears too fast:** Set Alert Style to "Alerts" (not "Banners") in System Settings > Notifications
